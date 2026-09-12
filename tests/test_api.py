@@ -67,7 +67,7 @@ class ApiTests(unittest.TestCase):
             ids = [2, 1]
             queries = []
 
-            def search(self, query):
+            def search(self, query, **options):
                 self.queries.append(query)
                 if self.error:
                     raise self.error

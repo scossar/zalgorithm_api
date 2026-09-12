@@ -12,7 +12,7 @@ Python 3.13 and `uv` are used for the application environment. Chroma is pinned 
 cd ~/projects/python/zalgorithm_api
 uv sync --locked
 INDEX_SNAPSHOT=../fragment_indexer/output/current \
-  uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+  uv run python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 Test the existing API:
@@ -38,7 +38,7 @@ has its own copy and model, so start with one worker for local development.
 
 | Request                               | Successful response                           |
 | ------------------------------------- | --------------------------------------------- |
-| `POST /api/query`, form field `query` | Up to five HTML fragments in search order     |
+| `POST /api/query`, form field `query` | Up to five HTML fragments in search order; semantic by default     |
 | `GET /api/fragment/{row_id}`          | Close button, HTML heading, and HTML fragment |
 
 Success responses are still HTML, with the original HTMX close-button behavior.
@@ -47,9 +47,11 @@ expands when several embedding chunks represent the same fragment, up to a
 configurable cap. Distinct fragments with identical heading text remain distinct.
 
 Whitespace-only queries and empty result sets return empty HTML. Missing form
-fields, invalid IDs, and oversized queries return 422. Query inputs are limited to
-4096 characters and the encoder's actual 256-token limit, including special tokens;
-they are not silently truncated. Missing/deleted fragment IDs return HTML with
+fields, invalid IDs, and oversized queries return 422. Each query/filter field is
+limited to 4096 characters. Semantic and hybrid queries
+also enforce the encoder's actual 256-token limit, including special tokens;
+keyword-only queries and keyword expressions do not use that token limit. Inputs
+are not silently truncated. Missing/deleted fragment IDs return HTML with
 status 404. Backend failures or Chroma/SQLite reference mismatches return a generic
 503 response, with details logged server-side. API responses use `Cache-Control:
 no-store` so HTTP caching does not retain outdated fragment responses.
@@ -58,6 +60,88 @@ The current Hugo hook does not provide a special 404/503 UI. Its `click once`
 behavior also keeps already-loaded fragment HTML in the page until refresh.
 Those client-side behaviors are separate from this API update.
 
+## Keyword search, filters, and hybrid search
+
+The same `POST /api/query` route accepts these additional form fields. It still
+returns the existing fragment HTML; supplying only `query` preserves semantic search.
+
+| Field | Default | Meaning |
+| ----- | ------- | ------- |
+| `mode` | `semantic` | `semantic`, `keyword`, or `hybrid` |
+| `query` | Required | Semantic text, keyword text, or both in hybrid mode |
+| `keyword_query` | Use `query` | Optional keyword expression for **hybrid only** |
+| `include` | Unset | Require a keyword match in the fragment |
+| `exclude` | Unset | Exclude fragments matching this keyword expression |
+| `keyword_syntax` | `simple` | `simple` or `fts5`, applied to every keyword expression in the request |
+
+Both filters can be used together and apply in all three modes. Blank filters are
+ignored. `keyword_query` on another mode, an invalid mode/syntax, malformed keyword
+expressions, and oversized fields return 422. A whitespace-only main query returns
+empty HTML. Empty literal phrases and unclosed quotes are invalid.
+
+```bash
+# Keyword search alone
+curl -X POST -d 'mode=keyword' --data-urlencode 'query=gradient descent' \
+  http://127.0.0.1:8000/api/query
+
+# Semantic results must match "gradient" and must not match "reinforcement"
+curl -X POST --data-urlencode 'query=how learning works' \
+  -d 'include=gradient' -d 'exclude=reinforcement' \
+  http://127.0.0.1:8000/api/query
+
+# Merge semantic and keyword rankings (same text for both)
+curl -X POST -d 'mode=hybrid' --data-urlencode 'query=gradient descent' \
+  http://127.0.0.1:8000/api/query
+
+# Separate semantic text and an advanced keyword expression
+curl -X POST -d 'mode=hybrid' -d 'keyword_syntax=fts5' \
+  --data-urlencode 'query=how learning works' \
+  --data-urlencode 'keyword_query=(gradient OR stochastic) NOT reinforcement' \
+  http://127.0.0.1:8000/api/query
+```
+
+Simple syntax treats whitespace-separated terms as literals joined with `AND`;
+quoted phrases stay together. `gradient descent` requires both words, while
+`"gradient descent"` requires the phrase. Operator words such as `OR` are literal
+words in simple mode. The `unicode61` tokenizer ignores case and normalizes most
+Latin diacritics; punctuation follows SQLite tokenization. This is word matching,
+not arbitrary substring matching, stemming, or typo correction.
+
+Explicit `keyword_syntax=fts5` accepts SQLite FTS5 syntax: `AND`, `OR`, binary `NOT`,
+parentheses, quoted phrases, prefixes such as `grad*`, `NEAR`, and column filters
+such as `body:gradient`. Available columns are `page_title`, `headings`, and `body`.
+Use `exclude=reinforcement` for a standalone exclusion; FTS5's `NOT` requires a
+left-hand expression. Expressions are bound SQL parameters, and their grammar is
+validated against a disposable FTS table before searching the actual index.
+
+The indexer builds `sections_fts` inside `sqlite/sections.db`, with one row per
+**complete fragment**, sharing `rowid` with `sections.id`. Titles, heading ancestry,
+and extracted plain text are searchable. The existing `sections.page_url` remains
+the canonical post path and can be retrieved using that ID. Responses do not yet
+expose additional structured metadata or keyword highlighting.
+
+Keyword results use BM25 with title/heading/body weights of 3/2/1. Inclusion and
+exclusion collect **all** matching IDs before retrieval, independently of result
+or candidate limits. Chroma receives a `db_id` metadata filter, so eligible
+fragments can be found even when they were outside the original semantic top five.
+Keyword matches anywhere in a fragment qualify all its embedding chunks.
+
+Hybrid mode applies filters to both searches, deduplicates semantic chunks by
+fragment ID, and merges the ranked lists using equal-weight reciprocal rank fusion:
+`score = sum(1 / (60 + rank))`, with ranks starting at one. A fragment absent from a
+list gets no contribution from that list. Ties use ascending fragment ID.
+`SEARCH_CANDIDATE_LIMIT` caps semantic embedding chunks examined and the keyword
+candidate list (default 200); duplicate chunks can make the semantic fragment list
+shorter. Fusion happens before `SEARCH_RESULT_LIMIT` (default five). The candidate
+cap can also make filtered semantic results shorter than the requested limit.
+
+Rebuild with the updated `fragment_indexer` to enable keyword features, then restart
+the API to load the new snapshot. Startup checks the keyword index version, fields,
+and fragment IDs. Older snapshots without FTS remain usable for unfiltered semantic
+search; keyword-dependent requests return 503 with a rebuild message. The API never
+builds or changes the keyword index. Keyword-only requests do not encode queries or
+query Chroma, although application startup still initializes the semantic backend.
+
 ## Separate Chroma server
 
 Leave `INDEX_SNAPSHOT` unset to use the existing architecture:
@@ -65,7 +149,7 @@ Leave `INDEX_SNAPSHOT` unset to use the existing architecture:
 ```bash
 CHROMA_HOST=127.0.0.1 CHROMA_PORT=8001 \
 SQLITE_DB_PATH=/path/to/matching/sqlite/sections.db \
-  uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+  uv run python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 The SQLite file and Chroma server must contain the same completed release. This
@@ -134,5 +218,6 @@ The first command runs unit/API tests and skips integration tests. The second al
 runs a real MiniLM query against a private snapshot copy and starts a temporary
 Chroma HTTP server bound to loopback. The server is stopped when its test finishes;
 source snapshots are never modified. Tests cover ranking and duplicate chunks,
-HTML/form compatibility, invalid queries and IDs, missing/deleted fragments,
+HTML/form compatibility, keyword/Boolean syntax, whole-fragment filtering, RRF,
+legacy snapshots, invalid queries and IDs, missing/deleted fragments,
 backend errors, CORS, application cleanup, and both database modes.

@@ -2,7 +2,8 @@
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Annotated
+from html import escape
+from typing import Annotated, Literal
 
 import aiosqlite
 from fastapi import Depends, FastAPI, Form, Path, Request
@@ -10,8 +11,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from starlette.concurrency import run_in_threadpool
 
-from .backend import Backend, QueryTooLong, sqlite_uri
+from .backend import Backend, sqlite_uri
 from .config import Settings
+from .keyword import KeywordIndexUnavailable, SearchInputError
 
 log = logging.getLogger(__name__)
 CLOSE_BUTTON = '<button type="button" aria-label="Close fragment" onclick=\'this.parentNode.classList.toggle("hidden");\'>x</button>'
@@ -66,17 +68,31 @@ def create_app(settings: Settings | None = None, backend_factory=Backend) -> Fas
 
     @app.post("/api/query", response_class=HTMLResponse)
     async def query_collection(
-        request: Request, db: Database, query: Annotated[str, Form(max_length=4096)]
+        request: Request, db: Database, query: Annotated[str, Form(max_length=4096)],
+        mode: Annotated[Literal["semantic", "keyword", "hybrid"], Form()] = "semantic",
+        keyword_query: Annotated[str | None, Form(max_length=4096)] = None,
+        include: Annotated[str | None, Form(max_length=4096)] = None,
+        exclude: Annotated[str | None, Form(max_length=4096)] = None,
+        keyword_syntax: Annotated[Literal["simple", "fts5"], Form()] = "simple",
     ):
         query = query.strip()
-        if not query:
-            return ""
         try:
-            db_ids = await run_in_threadpool(request.app.state.backend.search, query)
-        except QueryTooLong as error:
-            return HTMLResponse(f"<p>{error}</p>", status_code=422)
+            if not query:
+                return ""
+            db_ids = await run_in_threadpool(
+                request.app.state.backend.search, query, mode=mode,
+                keyword_query=keyword_query, include=include, exclude=exclude,
+                keyword_syntax=keyword_syntax,
+            )
+        except SearchInputError as error:
+            return HTMLResponse(f"<p>{escape(str(error))}</p>", status_code=422)
+        except KeywordIndexUnavailable:
+            return HTMLResponse(
+                "<p>Keyword search is unavailable until the fragment index is rebuilt.</p>",
+                status_code=503,
+            )
         except Exception:
-            log.exception("Chroma query failed")
+            log.exception("Search query failed")
             return HTMLResponse(
                 "<p>Search is temporarily unavailable.</p>", status_code=503
             )
@@ -90,7 +106,7 @@ def create_app(settings: Settings | None = None, backend_factory=Backend) -> Fas
             rows = {row[0]: row[1] + row[2] for row in await cursor.fetchall()}
         if any(db_id not in rows for db_id in db_ids):
             log.error(
-                "Chroma/SQLite mismatch: a search result references a missing fragment"
+                "Search index/SQLite mismatch: a result references a missing fragment"
             )
             return HTMLResponse(
                 "<p>Search data is temporarily unavailable.</p>", status_code=503

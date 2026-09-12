@@ -14,9 +14,18 @@ from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 from tokenizers import Tokenizer
 
 from .config import Settings
+from .keyword import (
+    KeywordIndexUnavailable,
+    SearchInputError,
+    keyword_expression,
+    matching_ids,
+    ranked_ids,
+    reciprocal_rank_fusion,
+    validate_keyword_index,
+)
 
 
-class QueryTooLong(ValueError):
+class QueryTooLong(SearchInputError):
     pass
 
 
@@ -25,7 +34,7 @@ def sqlite_uri(path: Path) -> str:
 
 
 def select_fragment_ids(
-    collection, query: str, limit: int, candidate_limit: int
+    collection, query: str, limit: int, candidate_limit: int, where=None
 ) -> list[int]:
     """Expand the ranked candidate window when chunks repeat the same fragment."""
     total = min(collection.count(), candidate_limit)
@@ -34,7 +43,8 @@ def select_fragment_ids(
         return []
     while True:
         result = collection.query(
-            query_texts=[query], n_results=size, include=["metadatas"]
+            query_texts=[query], n_results=size, include=["metadatas"],
+            **({"where": where} if where else {}),
         )
         groups = result.get("metadatas")
         if not groups:
@@ -50,7 +60,8 @@ def select_fragment_ids(
                 unique.append(db_id)
                 if len(unique) == limit:
                     return unique
-        if size >= total:
+        # A filtered collection may have fewer chunks than count() reports.
+        if size >= total or len(groups[0]) < size:
             return unique
         size = min(total, size * 2)
 
@@ -101,6 +112,9 @@ class Backend:
                     raise ValueError(
                         "Snapshot SQLite count differs from build manifest"
                     )
+                self.has_keyword_index = validate_keyword_index(
+                    db, metadata.get("keyword_index") if metadata else None
+                )
 
             chroma_settings = ChromaSettings(anonymized_telemetry=False)
             if settings.snapshot is not None:
@@ -136,15 +150,71 @@ class Backend:
             self.close()
             raise
 
-    def search(self, query: str) -> list[int]:
-        if len(self.tokenizer.encode(query).ids) > 256:
+    def search(
+        self, query: str, *, mode: str = "semantic", keyword_query: str | None = None,
+        include: str | None = None, exclude: str | None = None,
+        keyword_syntax: str = "simple",
+    ) -> list[int]:
+        if mode not in {"semantic", "keyword", "hybrid"}:
+            raise SearchInputError("Unknown search mode")
+        if keyword_query is not None and mode != "hybrid":
+            raise SearchInputError("keyword_query is only supported in hybrid mode")
+        if keyword_query is not None and not keyword_query.strip():
+            raise SearchInputError("keyword_query must not be empty")
+        query = query.strip()
+        include = include.strip() if include and include.strip() else None
+        exclude = exclude.strip() if exclude and exclude.strip() else None
+        if not query:
+            return []
+        if mode != "keyword" and len(self.tokenizer.encode(query).ids) > 256:
             raise QueryTooLong("Query exceeds the embedding model's 256-token limit")
-        return select_fragment_ids(
+        needs_keywords = mode != "semantic" or include is not None or exclude is not None
+        included, excluded, keywords = None, set(), []
+        if needs_keywords:
+            if not self.has_keyword_index:
+                raise KeywordIndexUnavailable(
+                    "Keyword search requires a rebuilt fragment-indexer snapshot"
+                )
+            expressions = {
+                name: keyword_expression(value, keyword_syntax)
+                for name, value in {
+                    "query": (keyword_query if keyword_query is not None else query)
+                    if mode != "semantic" else None,
+                    "include": include, "exclude": exclude,
+                }.items() if value is not None
+            }
+            with closing(sqlite3.connect(sqlite_uri(self.db_path), uri=True)) as db:
+                if include is not None:
+                    included = matching_ids(db, expressions["include"])
+                if exclude is not None:
+                    excluded = matching_ids(db, expressions["exclude"])
+                if included is not None:
+                    included -= excluded
+                    if not included:
+                        return []
+                if mode != "semantic":
+                    keywords = ranked_ids(
+                        db, expressions["query"],
+                        self.settings.result_limit if mode == "keyword" else self.settings.candidate_limit,
+                        included, excluded,
+                    )
+            if mode == "keyword":
+                return keywords
+        where = None
+        if included is not None:
+            where = {"db_id": {"$in": sorted(included)}}
+        elif excluded:
+            where = {"db_id": {"$nin": sorted(excluded)}}
+        semantic = select_fragment_ids(
             self.collection,
             query,
-            self.settings.result_limit,
+            self.settings.candidate_limit if mode == "hybrid" else self.settings.result_limit,
             self.settings.candidate_limit,
+            where=where,
         )
+        if mode == "hybrid":
+            return reciprocal_rank_fusion(semantic, keywords, limit=self.settings.result_limit)
+        return semantic
 
     def close(self):
         try:

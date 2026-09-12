@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
+from test_snapshot import check_keyword_modes
 
 SNAPSHOT = os.getenv('TEST_INDEX_SNAPSHOT')
 
@@ -34,7 +35,7 @@ class HttpChromaTests(unittest.TestCase):
                 listener.bind(('127.0.0.1', 0))
                 port = listener.getsockname()[1]
             with (working / 'server.log').open('w+') as logfile:
-                server = subprocess.Popen([str(Path(sys.executable).parent / 'chroma'), 'run',
+                server = subprocess.Popen([sys.executable, str(Path(sys.executable).parent / 'chroma'), 'run',
                                            '--path', str(working / 'chroma'), '--host', '127.0.0.1',
                                            '--port', str(port)], stdout=logfile, stderr=subprocess.STDOUT)
                 try:
@@ -59,6 +60,7 @@ class HttpChromaTests(unittest.TestCase):
                         self.assertEqual(response.status_code, 200, response.text)
                         self.assertIn('article-fragment', response.text)
                         self.assertEqual(client.get(f'/api/fragment/{fragment_id}').status_code, 200)
+                        check_keyword_modes(self, app.state.backend, client)
                 finally:
                     server.terminate()
                     try:
