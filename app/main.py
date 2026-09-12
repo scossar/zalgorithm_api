@@ -1,114 +1,88 @@
-from fastapi import Depends, FastAPI, Form, HTTPException
-from fastapi.responses import HTMLResponse
-from typing import Annotated, Any
-from fastapi.middleware.cors import CORSMiddleware
-import chromadb
-
-from chromadb.api.models.AsyncCollection import AsyncCollection
-from chromadb.api import AsyncClientAPI
-import os
+"""Existing HTML API, with explicit app lifecycle and replaceable backend factory."""
+from contextlib import asynccontextmanager
+import logging
+from typing import Annotated
 
 import aiosqlite
-from contextlib import asynccontextmanager
+from fastapi import Depends, FastAPI, Form, Path, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from starlette.concurrency import run_in_threadpool
+
+from .backend import Backend, QueryTooLong, sqlite_uri
+from .config import Settings
+
+log = logging.getLogger(__name__)
+CLOSE_BUTTON = '<button type="button" aria-label="Close fragment" onclick=\'this.parentNode.classList.toggle("hidden");\'>x</button>'
 
 
-chroma_host = os.getenv("CHROMA_HOST", "localhost")
-chroma_port = os.getenv("CHROMA_PORT", "8000")
-db_path = os.getenv("SQLITE_DB_PATH", "/data/sections.db")
-
-
-collection_name = "zalgorithm"
-chroma_client: AsyncClientAPI
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # startup: create a single Chroma client for entire app lifetime
-    global chroma_client
-    chroma_client = await chromadb.AsyncHttpClient(
-        host=chroma_host, port=int(chroma_port)
-    )
-
-    yield
-
-
-app = FastAPI(lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:1313",
-        "https://zalgorithm.com",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-async def get_db_connection() -> aiosqlite.Connection | Any:
-    db = await aiosqlite.connect(db_path)
-    db.row_factory = aiosqlite.Row
-
-    try:
+async def get_db_connection(request: Request):
+    async with aiosqlite.connect(sqlite_uri(request.app.state.backend.db_path), uri=True) as db:
         yield db
-    finally:
-        await db.close()
 
 
-async def get_chroma_collection() -> AsyncCollection:
-    collection = await chroma_client.get_collection(name=collection_name)
-    return collection
+Database = Annotated[aiosqlite.Connection, Depends(get_db_connection)]
 
 
-@app.post("/api/query", response_class=HTMLResponse)
-async def query_collection(
-    query: Annotated[str, Form()],
-    db: aiosqlite.Connection = Depends(get_db_connection, scope="function"),
-    collection: AsyncCollection = Depends(get_chroma_collection),
-):
-    try:
-        results = await collection.query(query_texts=[query], n_results=5)
-        seen_sections = set()
-        html_sections = []
+def create_app(settings: Settings | None = None, backend_factory=Backend) -> FastAPI:
+    settings = settings or Settings.from_env()
 
-        if not results["metadatas"]:
-            return ""  # for now
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.backend = await run_in_threadpool(backend_factory, settings)
+        try:
+            yield
+        finally:
+            await run_in_threadpool(app.state.backend.close)
 
-        for i in range(len(results["ids"][0])):
-            metadata = results["metadatas"][0][i]
+    app = FastAPI(title="Zalgorithm search", lifespan=lifespan)
+    app.add_middleware(CORSMiddleware, allow_origins=list(settings.cors_origins),
+                       allow_credentials=True, allow_methods=["GET", "POST"], allow_headers=["*"])
 
-            section_heading = metadata.get("section_heading", "")
-            if section_heading in seen_sections:
-                continue
+    @app.middleware("http")
+    async def no_cache(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
-            seen_sections.add(section_heading)
+    @app.exception_handler(aiosqlite.Error)
+    async def database_error(request: Request, error: aiosqlite.Error):
+        log.error("Fragment database unavailable", exc_info=(type(error), error, error.__traceback__))
+        return HTMLResponse("<p>Fragment database is temporarily unavailable.</p>", status_code=503)
 
-            row_id = metadata.get("db_id", None)
-            cursor = await db.execute(
-                "SELECT html_heading, html_fragment FROM sections WHERE id = ?", (row_id,)
-            )
+    @app.post("/api/query", response_class=HTMLResponse)
+    async def query_collection(request: Request, db: Database,
+                               query: Annotated[str, Form(max_length=4096)]):
+        query = query.strip()
+        if not query:
+            return ""
+        try:
+            db_ids = await run_in_threadpool(request.app.state.backend.search, query)
+        except QueryTooLong as error:
+            return HTMLResponse(f"<p>{error}</p>", status_code=422)
+        except Exception:
+            log.exception("Chroma query failed")
+            return HTMLResponse("<p>Search is temporarily unavailable.</p>", status_code=503)
+        if not db_ids:
+            return ""
+        placeholders = ",".join("?" for _ in db_ids)
+        async with db.execute(f"SELECT id, html_heading, html_fragment FROM sections WHERE id IN ({placeholders})", db_ids) as cursor:
+            rows = {row[0]: row[1] + row[2] for row in await cursor.fetchall()}
+        if any(db_id not in rows for db_id in db_ids):
+            log.error("Chroma/SQLite mismatch: a search result references a missing fragment")
+            return HTMLResponse("<p>Search data is temporarily unavailable.</p>", status_code=503)
+        return "".join(rows[db_id] for db_id in db_ids)
+
+    @app.get("/api/fragment/{row_id}", response_class=HTMLResponse)
+    async def get_fragment(row_id: Annotated[int, Path(gt=0)], db: Database):
+        async with db.execute("SELECT html_heading, html_fragment FROM sections WHERE id = ?", (row_id,)) as cursor:
             row = await cursor.fetchone()
-            if row:
-                section_html = "".join(row)
-                html_sections.append(section_html)
+        if row is None:
+            return HTMLResponse("<p>This fragment is no longer available.</p>", status_code=404)
+        return CLOSE_BUTTON + row[0] + row[1]
 
-        response_html = "".join(html_sections)
-        return response_html
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return app
 
 
-@app.get("/api/fragment/{row_id}", response_class=HTMLResponse)
-async def get_fragment(
-    row_id, db: aiosqlite.Connection = Depends(get_db_connection, scope="function")
-):
-    cursor = await db.execute(
-        "SELECT html_heading, html_fragment FROM sections WHERE id = ?", (row_id,)
-    )
-    row = await cursor.fetchone()
-    if row:
-        return f"<button onclick='this.parentNode.classList.toggle(\"hidden\");'>x</button>{row[0]}{row[1]}"
-    else:
-        return "<p>Something went wrong</p>"
+app = create_app()

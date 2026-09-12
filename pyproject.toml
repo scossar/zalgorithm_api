@@ -1,0 +1,19 @@
+[project]
+name = "zalgorithm-search"
+version = "0.2.0"
+description = "HTML search and fragment API for Hugo and Chroma"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "aiosqlite==0.22.1",
+    "chromadb==1.5.9",
+    "fastapi==0.128.0",
+    "python-multipart>=0.0.21,<1",
+    "uvicorn>=0.40,<1",
+    "tokenizers>=0.20,<1",
+]
+
+[dependency-groups]
+dev = ["httpx>=0.28,<1"]
+
+[tool.uv]
+package = false

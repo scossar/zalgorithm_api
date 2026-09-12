@@ -5,3 +5,5 @@ chroma/
 docker-compose.override.yml
 
 last_session
+.venv.pre-update-*/
+.backups/
