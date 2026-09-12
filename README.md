@@ -1,8 +1,7 @@
 # Zalgorithm API
 
-The existing HTML API, updated for the fragment indexer's permanent numeric IDs.
-It supports either a completed local indexer snapshot or a separate Chroma server.
-No endpoint generates or changes embeddings or source HTML.
+The Zalgorithm blog's HTML API. It supports either a completed local indexer snapshot
+or a separate Chroma server. No endpoint generates or changes embeddings or source HTML.
 
 ## Local development without Docker
 
@@ -37,10 +36,10 @@ has its own copy and model, so start with one worker for local development.
 
 ## Endpoints
 
-| Request | Successful response |
-| --- | --- |
-| `POST /api/query`, form field `query` | Up to five HTML fragments in search order |
-| `GET /api/fragment/{row_id}` | Close button, HTML heading, and HTML fragment |
+| Request                               | Successful response                           |
+| ------------------------------------- | --------------------------------------------- |
+| `POST /api/query`, form field `query` | Up to five HTML fragments in search order     |
+| `GET /api/fragment/{row_id}`          | Close button, HTML heading, and HTML fragment |
 
 Success responses are still HTML, with the original HTMX close-button behavior.
 Search results are deduplicated by `db_id`, not heading text. Candidate retrieval
@@ -75,17 +74,17 @@ encoder for queries. The Chroma collection must exist; startup does not create a
 empty replacement. Blocking Chroma I/O and model inference run in a worker thread,
 so they do not block FastAPI's event loop. Clients are closed at shutdown.
 
-| Variable | Default |
-| --- | --- |
-| `INDEX_SNAPSHOT` | Unset: use the HTTP Chroma server |
-| `SQLITE_DB_PATH` | `/data/sections.db` |
-| `CHROMA_HOST` | `localhost` |
-| `CHROMA_PORT` | `8000` |
-| `CHROMA_SSL` | `false` |
-| `CHROMA_COLLECTION` | `zalgorithm` |
-| `SEARCH_RESULT_LIMIT` | `5` |
-| `SEARCH_CANDIDATE_LIMIT` | `200` |
-| `CORS_ORIGINS` | `http://localhost:1313,http://127.0.0.1:1313,https://zalgorithm.com` |
+| Variable                 | Default                                                              |
+| ------------------------ | -------------------------------------------------------------------- |
+| `INDEX_SNAPSHOT`         | Unset: use the HTTP Chroma server                                    |
+| `SQLITE_DB_PATH`         | `/data/sections.db`                                                  |
+| `CHROMA_HOST`            | `localhost`                                                          |
+| `CHROMA_PORT`            | `8000`                                                               |
+| `CHROMA_SSL`             | `false`                                                              |
+| `CHROMA_COLLECTION`      | `zalgorithm`                                                         |
+| `SEARCH_RESULT_LIMIT`    | `5`                                                                  |
+| `SEARCH_CANDIDATE_LIMIT` | `200`                                                                |
+| `CORS_ORIGINS`           | `http://localhost:1313,http://127.0.0.1:1313,https://zalgorithm.com` |
 
 Snapshot mode takes precedence over the remote connection settings and
 `SQLITE_DB_PATH`. CORS origins are a comma-separated list. Query encoding stays
