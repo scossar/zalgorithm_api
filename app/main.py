@@ -38,7 +38,7 @@ def create_app(settings: Settings | None = None, backend_factory=Backend) -> Fas
         finally:
             await run_in_threadpool(app.state.backend.close)
 
-    app = FastAPI(title="Zalgorithm search", lifespan=lifespan)
+    app = FastAPI(title="Zalgorithm API", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),

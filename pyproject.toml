@@ -1,5 +1,5 @@
 [project]
-name = "zalgorithm-search"
+name = "zalgorithm-api"
 version = "0.2.0"
 description = "HTML search and fragment API for Hugo and Chroma"
 requires-python = ">=3.13,<3.14"

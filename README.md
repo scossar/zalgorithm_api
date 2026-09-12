@@ -1,4 +1,4 @@
-# Zalgorithm search API
+# Zalgorithm API
 
 The existing HTML API, updated for the fragment indexer's permanent numeric IDs.
 It supports either a completed local indexer snapshot or a separate Chroma server.
@@ -10,7 +10,7 @@ Python 3.13 and `uv` are used for the application environment. Chroma is pinned 
 1.5.9 to match `fragment_indexer`. Install from the lock and serve a completed build:
 
 ```bash
-cd ~/projects/python/zalgorithm_search
+cd ~/projects/python/zalgorithm_api
 uv sync --locked
 INDEX_SNAPSHOT=../fragment_indexer/output/current \
   uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
