@@ -1,4 +1,4 @@
-"""Existing HTML API, with explicit app lifecycle and replaceable backend factory."""
+"""HTML API, with explicit app lifecycle and replaceable backend factory."""
 
 import logging
 from contextlib import asynccontextmanager
